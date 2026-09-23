@@ -20,8 +20,16 @@
 - **规则版本锁定**：案件进入可奖励阶段时锁定当时生效的规则；之后的行政复议、
   判决变化即使跨越规则生效日，也按锁定版本重算。
 - **只追加调整**：撤回、重复确认、复议、判决变化均产生追加决定，原决定原样保留；
-  追加决定同样走审核（及必要时会签），生效后自动补付或追回，驳回则旧结论维持。
-- **匿名支付**：匿名举报生成一次性领取码，支付时校验，业务记录仍只写别名。
+  追加决定同样走审核（及必要时会签），驳回则旧结论维持。调整生效不自动改写账务：
+  降额只就已超付部分形成"应追回差额"（不超过实付），升额只开放新增可支付余额，
+  由后续支付请求逐笔领取。
+- **支付幂等与并发屏障**：每个支付请求必须带调用方生成的稳定业务标识
+  `request_id`，并与决定、金额、领取人（别名）绑定；原样重试直接回放首次凭证，
+  同标识异内容返回 `IDEMPOTENCY_CONFLICT`。余额检查与落账在同一临界区内完成，
+  并发拆付不会超过已生效决定的上限；在途追加决定（审核/会签中）期间支付一律
+  按顺序暂缓，返回 `INVALID_STATE`。
+- **匿名支付**：匿名举报生成一次性领取码，支付时校验，业务记录仍只写别名；
+  领取码只参与哈希校验，不进入凭证、普通日志或错误信息。
 
 规则版本与系数集中在 `reward_center.py` 的 `DEFAULT_RULES`（当前含 2023-01、
 2026-01 两版，可扩展）。
@@ -42,13 +50,13 @@
 | `POST /rewards/propose` | 按规则自动生成奖励建议（禁止手填金额） |
 | `POST /rewards/approve` | 奖励审核（拒绝自审） |
 | `POST /rewards/cosign` | 财政会签（仅 ≥ 20 万元时需要） |
-| `POST /rewards/pay` | 支付（匿名须带 `claim_code`） |
+| `POST /rewards/pay` | 支付（须带 `request_id`，可选 `alias` 绑定领取人；匿名须带 `claim_code`；支持部分支付 `amount`） |
 | `POST /rewards/adjust` | 追加决定：withdrawal/duplicate/reconsideration/judgment |
 | `POST /rewards/adjustment/approve` | 追加决定审核 |
 | `POST /rewards/adjustment/cosign` | 追加决定会签 |
 | `POST /commendations` | 登记精神奖励 |
 | `POST /identity/reveal` | 查看真实身份（受限且留痕） |
-| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/实际支付/调整沿革 |
+| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/逐笔支付/累计支付/剩余金额/调整沿革 |
 | `GET /cases/{id}/file` | 承办人办案视图（仅别名） |
 | `GET /cases/{id}/public` | 对外材料 |
 | `GET /cases/{id}/log` | 普通办案日志 |
@@ -59,8 +67,20 @@
 ```bash
 python3 service.py --check   # 规则与服务自检
 python3 service.py --port 8000
-npm test                     # 契约 + 领域规则 + HTTP 端到端，共 33 项
+npm test                     # 契约 + 领域规则 + HTTP 端到端 + 支付链，共 55 项
 ```
+
+错误响应为稳定结构 `{"error": {"code": "...", "message": "..."}}`，
+`code` 可用于客户端分支：`NOT_FOUND`(404)、`PERMISSION_DENIED`(403)、
+`INVALID_STATE`(409)、`IDEMPOTENCY_CONFLICT`(409)、
+`PAYMENT_REQUEST_ID_REQUIRED`/`INSUFFICIENT_BALANCE`/`PAYEE_MISMATCH`(400)。
+
+`/rewards/pay` 幂等契约：同一 `request_id` + 相同（决定、金额、领取人）的重试
+返回首次凭证（`replayed: true`，同一 `payment_id`），不重复落账；同标识异内容
+返回 409。`GET /cases/{id}/explain` 中每人含 `paid_out_total`（实付）、
+`clawed_back_total`（应追回）、`paid_total`（净额）、`remaining_amount`
+（剩余可支付额度，在途调整期间为 0）与逐笔 `payments`；案件级含
+`paid_total`/`remaining_total`。
 
 `fixtures/domain.json` 保存领域名词与状态样例，便于接口联调时保持一致语义。
 当前状态保存在进程内存中，适合规则验证与联调；正式部署需接入持久化存储。

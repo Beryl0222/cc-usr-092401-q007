@@ -186,9 +186,9 @@ class ThreeReportersTest(unittest.TestCase):
             {"alias": self.a3, "grade": 2, "key_contribution": True},
         ])
         self.c.pay_decision(decisions[self.a1]["decision_id"], "payer-1",
-                            PAYER, claim_code=self.code1)
+                            PAYER, claim_code=self.code1, request_id="pay-a1")
         self.c.pay_decision(decisions[self.a3]["decision_id"], "payer-1",
-                            PAYER, claim_code=self.code3)
+                            PAYER, claim_code=self.code3, request_id="pay-a3")
         explained = {r["alias"]: r for r in
                      self.c.explain_case(self.case)["reporters"]}
         self.assertEqual(explained[self.a1]["paid_total"], 300_000)
@@ -222,14 +222,16 @@ class NoPenaltyCaseTest(unittest.TestCase):
     def test_anonymous_requires_claim_code(self):
         did = self.decisions[self.anon]["decision_id"]
         with self.assertRaises(PermissionDenied):
-            self.c.pay_decision(did, "payer-1", PAYER)
+            self.c.pay_decision(did, "payer-1", PAYER, request_id="pay-anon")
         with self.assertRaises(PermissionDenied):
-            self.c.pay_decision(did, "payer-1", PAYER, claim_code="00000000")
-        self.c.pay_decision(did, "payer-1", PAYER, claim_code=self.code)
+            self.c.pay_decision(did, "payer-1", PAYER, claim_code="00000000",
+                                request_id="pay-anon")
+        self.c.pay_decision(did, "payer-1", PAYER, claim_code=self.code,
+                            request_id="pay-anon")
 
     def test_explained_without_penalty(self):
         self.c.pay_decision(self.decisions[self.insider]["decision_id"],
-                            "payer-1", PAYER)
+                            "payer-1", PAYER, request_id="pay-insider")
         explained = {r["alias"]: r for r in
                      self.c.explain_case(self.case)["reporters"]}
         self.assertEqual(explained[self.insider]["paid_total"], 4500)
@@ -254,7 +256,7 @@ class CrossEffectiveDateReconsiderationTest(unittest.TestCase):
         self.did = decisions[self.alias]["decision_id"]
         # 2023 版一级比例 5%：500 万 × 5% = 25 万（达到会签线，已会签）
         self.assertEqual(self.c.decisions[self.did]["amount"], 250_000)
-        self.c.pay_decision(self.did, "payer-1", PAYER)
+        self.c.pay_decision(self.did, "payer-1", PAYER, request_id="pay-cross")
 
     def test_reconsideration_recomputes_under_old_rules_and_claws_back(self):
         adj_id = self.c.adjust_decision(
@@ -273,7 +275,8 @@ class CrossEffectiveDateReconsiderationTest(unittest.TestCase):
             [p["stage"] for p in explained["pending_approvals"]],
             ["调整审核"])
         with self.assertRaises(InvalidStateError):
-            self.c.pay_decision(self.did, "payer-1", PAYER)
+            self.c.pay_decision(self.did, "payer-1", PAYER,
+                                request_id="pay-during-pending")
 
         self.c.review_adjustment(adj_id, "reviewer-2", REVIEWER)
         self.assertEqual(self.c.adjustments[adj_id]["status"], "已生效")
@@ -394,7 +397,7 @@ class WithdrawalAndDuplicateAdjustmentTest(unittest.TestCase):
         # 100 万 ×4%×0.7 = 2.8 万，无需会签
         self.did = self.c.propose_rewards(self.case, "handler-1", HANDLER)[0]
         self.c.approve_decision(self.did, "reviewer-1", REVIEWER)
-        self.c.pay_decision(self.did, "payer-1", PAYER)
+        self.c.pay_decision(self.did, "payer-1", PAYER, request_id="pay-wd")
         self.assertEqual(self.c.decisions[self.did]["amount"], 28_000)
 
     def test_withdrawal_after_payment_claws_back(self):

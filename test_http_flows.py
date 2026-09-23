@@ -111,7 +111,7 @@ class HttpFlowTest(unittest.TestCase):
             self.assertEqual(body["status"], "已生效")
             self.post("/rewards/pay", {
                 "actor": actor("payer-1", "payment_officer"),
-                "decision_id": did})
+                "decision_id": did, "request_id": f"pay-{did}"})
 
         _, explain = self.get(f"/cases/{case_id}/explain")
         by_alias = {r["alias"]: r for r in explain["reporters"]}
@@ -167,18 +167,56 @@ class HttpFlowTest(unittest.TestCase):
             "actor": actor("reviewer-1", "reward_reviewer"),
             "decision_id": did})
 
-        # 无领取码 / 错码：403
+        # 无领取码 / 错码：403（领取码校验先于其他参数）
         self.assertEqual(self.post("/rewards/pay", {
             "actor": actor("payer-1", "payment_officer"),
             "decision_id": did})[0], 403)
-        self.assertEqual(self.post("/rewards/pay", {
+        status_bad_code, body_bad_code = self.post("/rewards/pay", {
             "actor": actor("payer-1", "payment_officer"),
-            "decision_id": did, "claim_code": "deadbeef"})[0], 403)
-        status, paid = self.post("/rewards/pay", {
+            "decision_id": did, "claim_code": "deadbeef"})
+        self.assertEqual(status_bad_code, 403)
+        # 错误响应是稳定错误体，且绝不回显提交的领取码
+        self.assertEqual(body_bad_code["error"]["code"], "PERMISSION_DENIED")
+        self.assertNotIn("deadbeef", json.dumps(body_bad_code))
+
+        # 缺稳定业务标识：400 + 稳定错误码
+        status_no_id, body_no_id = self.post("/rewards/pay", {
             "actor": actor("payer-1", "payment_officer"),
             "decision_id": did, "claim_code": code})
+        self.assertEqual(status_no_id, 400)
+        self.assertEqual(body_no_id["error"]["code"],
+                         "PAYMENT_REQUEST_ID_REQUIRED")
+
+        status, paid = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "claim_code": code,
+            "request_id": "pay-anon-1"})
         self.assertEqual(status, 200)
         self.assertEqual(paid["amount"], 3000)  # 2026 版三级无罚没款定额
+        self.assertFalse(paid["replayed"])
+        self.assertNotIn("claim_code", json.dumps(paid))
+
+        # 原样重试：回放首次凭证（同一 payment_id），不重复落账
+        status, replay = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "claim_code": code,
+            "request_id": "pay-anon-1"})
+        self.assertEqual(status, 200)
+        self.assertTrue(replay["replayed"])
+        self.assertEqual(replay["payment_id"], paid["payment_id"])
+
+        # 同标识异金额：409 冲突
+        status_conflict, body_conflict = self.post("/rewards/pay", {
+            "actor": actor("payer-1", "payment_officer"),
+            "decision_id": did, "claim_code": code,
+            "request_id": "pay-anon-1", "amount": 1000})
+        self.assertEqual(status_conflict, 409)
+        self.assertEqual(body_conflict["error"]["code"],
+                         "IDEMPOTENCY_CONFLICT")
+
+        # 领取码不得进入普通办案日志
+        _, log = self.get(f"/cases/{case_id}/log")
+        self.assertNotIn(code, json.dumps(log, ensure_ascii=False))
 
     def test_cross_effective_date_reconsideration(self):
         _, body = self.post("/reports/intake", {
@@ -208,7 +246,7 @@ class HttpFlowTest(unittest.TestCase):
             "decision_id": did})
         self.post("/rewards/pay", {
             "actor": actor("payer-1", "payment_officer"),
-            "decision_id": did})
+            "decision_id": did, "request_id": "pay-cross"})
 
         # 2026 年发起复议，仍按 2023 版规则重算
         status, adj = self.post("/rewards/adjust", {

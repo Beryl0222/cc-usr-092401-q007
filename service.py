@@ -18,6 +18,7 @@ from reward_center import (
     NotFoundError,
     PermissionDenied,
     InvalidStateError,
+    IdempotencyConflict,
     basic_check,
 )
 
@@ -125,7 +126,9 @@ def handle_pay(center, body):
     record = center.pay_decision(
         body["decision_id"], actor_id, role,
         amount=body.get("amount"), claim_code=body.get("claim_code"),
-        paid_at=body.get("at"))
+        paid_at=body.get("at"),
+        request_id=body.get("request_id"),
+        alias=body.get("alias"))
     return 200, record
 
 
@@ -194,6 +197,7 @@ ERROR_STATUS = {
     NotFoundError: 404,
     PermissionDenied: 403,
     InvalidStateError: 409,
+    IdempotencyConflict: 409,
     DomainError: 400,
     KeyError: 400,
     TypeError: 400,
@@ -262,7 +266,9 @@ class Handler(BaseHTTPRequestHandler):
             raw = self.rfile.read(length) if length else b"{}"
             body = json.loads(raw.decode("utf-8") or "{}")
         except (ValueError, UnicodeDecodeError):
-            self._send_json(400, {"error": "请求体不是合法 JSON"})
+            self._send_json(400, {"error": {
+                "code": "BAD_REQUEST",
+                "message": "请求体不是合法 JSON"}})
             return
         try:
             status, payload = handler(CENTER, body)
@@ -270,7 +276,9 @@ class Handler(BaseHTTPRequestHandler):
             self._domain_error(exc)
             return
         except (KeyError, TypeError) as exc:
-            self._send_json(400, {"error": f"缺少或错误的参数：{exc}"})
+            self._send_json(400, {"error": {
+                "code": "MISSING_OR_BAD_PARAMETER",
+                "message": f"缺少或错误的参数：{exc}"}})
             return
         self._send_json(status, payload)
 
@@ -280,7 +288,9 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(exc, error_type):
                 status = code
                 break
-        self._send_json(status, {"error": str(exc)})
+        self._send_json(status, {"error": {
+            "code": getattr(exc, "code", "DOMAIN_INVALID"),
+            "message": str(exc)}})
 
     def log_message(self, *_args):
         return
