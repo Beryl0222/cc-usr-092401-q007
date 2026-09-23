@@ -186,9 +186,9 @@ class ThreeReportersTest(unittest.TestCase):
             {"alias": self.a3, "grade": 2, "key_contribution": True},
         ])
         self.c.pay_decision(decisions[self.a1]["decision_id"], "payer-1",
-                            PAYER, claim_code=self.code1)
+                            PAYER, "req-a1", claim_code=self.code1)
         self.c.pay_decision(decisions[self.a3]["decision_id"], "payer-1",
-                            PAYER, claim_code=self.code3)
+                            PAYER, "req-a3", claim_code=self.code3)
         explained = {r["alias"]: r for r in
                      self.c.explain_case(self.case)["reporters"]}
         self.assertEqual(explained[self.a1]["paid_total"], 300_000)
@@ -222,14 +222,16 @@ class NoPenaltyCaseTest(unittest.TestCase):
     def test_anonymous_requires_claim_code(self):
         did = self.decisions[self.anon]["decision_id"]
         with self.assertRaises(PermissionDenied):
-            self.c.pay_decision(did, "payer-1", PAYER)
+            self.c.pay_decision(did, "payer-1", PAYER, "req-anon")
         with self.assertRaises(PermissionDenied):
-            self.c.pay_decision(did, "payer-1", PAYER, claim_code="00000000")
-        self.c.pay_decision(did, "payer-1", PAYER, claim_code=self.code)
+            self.c.pay_decision(did, "payer-1", PAYER, "req-anon",
+                                claim_code="00000000")
+        self.c.pay_decision(did, "payer-1", PAYER, "req-anon",
+                            claim_code=self.code)
 
     def test_explained_without_penalty(self):
         self.c.pay_decision(self.decisions[self.insider]["decision_id"],
-                            "payer-1", PAYER)
+                            "payer-1", PAYER, "req-insider")
         explained = {r["alias"]: r for r in
                      self.c.explain_case(self.case)["reporters"]}
         self.assertEqual(explained[self.insider]["paid_total"], 4500)
@@ -254,7 +256,7 @@ class CrossEffectiveDateReconsiderationTest(unittest.TestCase):
         self.did = decisions[self.alias]["decision_id"]
         # 2023 版一级比例 5%：500 万 × 5% = 25 万（达到会签线，已会签）
         self.assertEqual(self.c.decisions[self.did]["amount"], 250_000)
-        self.c.pay_decision(self.did, "payer-1", PAYER)
+        self.c.pay_decision(self.did, "payer-1", PAYER, "req-orig")
 
     def test_reconsideration_recomputes_under_old_rules_and_claws_back(self):
         adj_id = self.c.adjust_decision(
@@ -273,18 +275,35 @@ class CrossEffectiveDateReconsiderationTest(unittest.TestCase):
             [p["stage"] for p in explained["pending_approvals"]],
             ["调整审核"])
         with self.assertRaises(InvalidStateError):
-            self.c.pay_decision(self.did, "payer-1", PAYER)
+            self.c.pay_decision(self.did, "payer-1", PAYER, "req-pending")
 
         self.c.review_adjustment(adj_id, "reviewer-2", REVIEWER)
         self.assertEqual(self.c.adjustments[adj_id]["status"], "已生效")
+        adj_after = self.c.adjustments[adj_id]
 
+        # 降额不撤销、不改写历史支付：25 万凭证原样保留；
+        # 差额只形成应追回 10 万，剩余可付为 0
         explained = self.c.explain_case(self.case)["reporters"][0]
         self.assertEqual(explained["effective_amount"], 150_000)
-        self.assertEqual(explained["paid_total"], 150_000)  # 25 万 - 10 万追回
+        self.assertEqual(explained["paid_total"], 250_000)
+        self.assertEqual(explained["clawback_due"], 100_000)
+        self.assertEqual(explained["remaining_amount"], 0)
+        self.assertEqual(len(explained["payment_vouchers"]), 1)
+        self.assertEqual(explained["payment_vouchers"][0]["amount"], 250_000)
+        self.assertEqual(explained["payment_vouchers"][0]["request_id"],
+                         "req-orig")
         self.assertEqual(len(explained["adjustments"]), 1)
         self.assertEqual(explained["adjustments"][0]["kind_label"],
                          "行政复议变化")
+        self.assertEqual(explained["adjustments"][0]["clawback_due"], 100_000)
+        self.assertEqual(explained["adjustments"][0]["open_balance"], 0)
         self.assertEqual(explained["pending_approvals"], [])
+        # 调整生效时固化的快照可核对
+        self.assertEqual(adj_after["paid_total_at_effect"], 250_000)
+        # 降额后无新增余额，不能再发起任何支付
+        from reward_center import PaymentRejected
+        with self.assertRaises(PaymentRejected):
+            self.c.pay_decision(self.did, "payer-1", PAYER, "req-after-down")
 
         # 旧结论继续保留：原决定仍是 25 万，且记录追加决定沿革
         self.assertEqual(self.c.decisions[self.did]["amount"], 250_000)
@@ -394,7 +413,7 @@ class WithdrawalAndDuplicateAdjustmentTest(unittest.TestCase):
         # 100 万 ×4%×0.7 = 2.8 万，无需会签
         self.did = self.c.propose_rewards(self.case, "handler-1", HANDLER)[0]
         self.c.approve_decision(self.did, "reviewer-1", REVIEWER)
-        self.c.pay_decision(self.did, "payer-1", PAYER)
+        self.c.pay_decision(self.did, "payer-1", PAYER, "req-wd")
         self.assertEqual(self.c.decisions[self.did]["amount"], 28_000)
 
     def test_withdrawal_after_payment_claws_back(self):
@@ -405,7 +424,13 @@ class WithdrawalAndDuplicateAdjustmentTest(unittest.TestCase):
         explained = self.c.explain_case(self.case)["reporters"][0]
         self.assertFalse(explained["eligible"])
         self.assertEqual(explained["effective_amount"], 0)
-        self.assertEqual(explained["paid_total"], 0)  # 28000 - 28000 追回
+        # 历史支付不撤销不改写：28000 凭证保留，另列应追回 28000
+        self.assertEqual(explained["paid_total"], 28_000)
+        self.assertEqual(explained["clawback_due"], 28_000)
+        self.assertEqual(explained["remaining_amount"], 0)
+        self.assertEqual(
+            [v["amount"] for v in explained["payment_vouchers"]], [28_000])
+        self.assertEqual(explained["adjustments"][0]["clawback_due"], 28_000)
 
     def test_withdrawal_before_approval_terminates_proposal(self):
         # 新举报 + 在途建议，随后撤回

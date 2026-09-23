@@ -14,9 +14,22 @@
 
 from __future__ import annotations
 
+import functools
 import hashlib
+import hmac
 import secrets
+import threading
 from datetime import date
+
+
+def _synchronized(method):
+    """在中心全局屏障锁内执行方法（RLock 允许同类方法嵌套调用）。"""
+
+    @functools.wraps(method)
+    def wrapper(self, *args, **kwargs):
+        with self._lock:
+            return method(self, *args, **kwargs)
+    return wrapper
 
 
 # ---------------------------------------------------------------------------
@@ -26,17 +39,38 @@ from datetime import date
 class DomainError(Exception):
     """领域规则被违反。"""
 
+    # 稳定错误码：服务层原样透传，调用方可据此做幂等/重试分支
+    error_code = "DOMAIN_ERROR"
+
 
 class NotFoundError(DomainError):
     """引用的对象不存在。"""
+
+    error_code = "NOT_FOUND"
 
 
 class PermissionDenied(DomainError):
     """操作者角色或身份不允许该操作。"""
 
+    error_code = "PERMISSION_DENIED"
+
 
 class InvalidStateError(DomainError):
     """当前状态不允许该操作。"""
+
+    error_code = "INVALID_STATE"
+
+
+class IdempotencyConflict(DomainError):
+    """同一稳定业务标识被用于内容不同的支付指令。"""
+
+    error_code = "IDEMPOTENCY_CONFLICT"
+
+
+class PaymentRejected(DomainError):
+    """支付指令未通过绑定/余额等校验（领取人不符、超出可付余额等）。"""
+
+    error_code = "PAYMENT_REJECTED"
 
 
 # ---------------------------------------------------------------------------
@@ -193,6 +227,13 @@ class RewardCenter:
         self.payments = []      # 支付记录（含追回，金额为负）
         self.event_log = []     # 普通办案日志（只含别名，绝不含身份）
 
+        # 屏障式并发：所有写操作与一致性读都在同一把可重入锁内串行化。
+        # 余额检查与支付落账借此落在同一个临界区，杜绝“两个并发请求读到
+        # 同一余额、合计超出已生效决定上限”的拆付超支。
+        self._lock = threading.RLock()
+        # 稳定业务标识 -> 首次支付凭证；重放原样返回，异内容拒绝
+        self._payment_index = {}
+
         self._case_seq = 0
         self._report_seq = 0
         self._decision_seq = 0
@@ -231,6 +272,7 @@ class RewardCenter:
     # 1. 举报接收（身份隔离）
     # ------------------------------------------------------------------
 
+    @_synchronized
     def intake_report(self, actor_id, actor_role, violation_category, facts,
                       received_at=None, identity=None, is_insider=False):
         """接收一条举报线索。
@@ -304,6 +346,7 @@ class RewardCenter:
         }
         return case_id
 
+    @_synchronized
     def link_report_to_case(self, alias, case_id):
         report = self._report(alias)
         case = self._case(case_id)
@@ -318,6 +361,7 @@ class RewardCenter:
             case["aliases"].append(alias)
         self._log("关联案件", alias=alias, case_id=case_id)
 
+    @_synchronized
     def add_supplement(self, alias, facts, added_at=None):
         """举报人补充证据材料（仍只按别名记录）。"""
         report = self._report(alias)
@@ -334,6 +378,7 @@ class RewardCenter:
     # 2. 案件流程
     # ------------------------------------------------------------------
 
+    @_synchronized
     def close_case(self, case_id, penalty_amount, closed_at=None):
         """结案并登记罚没款结果（可以为 0）。"""
         case = self._case(case_id)
@@ -344,6 +389,7 @@ class RewardCenter:
         case["status"] = "已结案"
         self._log("案件结案", case_id=case_id, penalty_amount=case["penalty_amount"])
 
+    @_synchronized
     def enter_reward_stage(self, case_id, entered_at=None):
         """案件进入可奖励阶段：锁定当时生效的规则版本。"""
         case = self._case(case_id)
@@ -361,6 +407,7 @@ class RewardCenter:
     # 3. 贡献认定（最先有效 / 独立关键 / 重复）
     # ------------------------------------------------------------------
 
+    @_synchronized
     def assess_contributions(self, case_id, assessments, actor_id, actor_role):
         """对案件下各举报进行贡献认定。
 
@@ -447,6 +494,7 @@ class RewardCenter:
             base *= rule["insider_multiplier"]
         return min(_round_yuan(base), rule["cap"])
 
+    @_synchronized
     def propose_rewards(self, case_id, handler_id, actor_role):
         """为案件下具备奖励资格的举报生成奖励建议。
 
@@ -522,6 +570,7 @@ class RewardCenter:
     # 5. 审批与会签（职责分离）
     # ------------------------------------------------------------------
 
+    @_synchronized
     def approve_decision(self, decision_id, reviewer_id, actor_role, approve=True):
         """奖励审核。审核人不得是建议人本人。"""
         if actor_role != ROLE_REVIEWER:
@@ -547,6 +596,7 @@ class RewardCenter:
                   status=d["status"])
         return d["status"]
 
+    @_synchronized
     def cosign_decision(self, decision_id, finance_id, actor_role, agree=True):
         """财政会签：二十万元以上的决定必须经此环节。"""
         if actor_role != ROLE_FINANCE:
@@ -570,53 +620,118 @@ class RewardCenter:
     # 6. 支付
     # ------------------------------------------------------------------
 
-    def pay_decision(self, decision_id, payer_id, actor_role, amount=None,
-                     claim_code=None, paid_at=None):
-        """对已生效决定执行支付。
+    @_synchronized
+    def pay_decision(self, decision_id, payer_id, actor_role, request_id,
+                     amount=None, alias=None, claim_code=None, paid_at=None):
+        """对已生效决定执行支付（幂等、绑定、临界区落账）。
 
-        匿名举报须出示领取码；支付记录只写别名，不写身份。
+        每个支付请求必须携带调用方生成的稳定业务标识 ``request_id``
+        （同一指令的网络重试必须原样复用，不得换新号）。
+
+        - 原样重试：同一 ``request_id`` 且决定/金额/领取人一致时，不重复
+          落账，直接返回首次生成的同一凭证；
+        - 同标识异内容：同一 ``request_id`` 绑定的决定、金额或领取人变化，
+          抛 IdempotencyConflict（稳定错误码 IDEMPOTENCY_CONFLICT）；
+        - 领取人绑定：``alias`` 必须与决定的领取人一致（匿名也有别名），
+          防止指令被转投到其他决定/领取人；
+        - 匿名举报须出示正确领取码，业务记录与返回中绝不包含领取码明文；
+        - 余额检查与支付落账在同一临界区（本方法整体持锁）完成，并发拆付
+          不会合计超过“最新已生效结论”的上限，支持部分支付。
         """
         if actor_role != ROLE_PAYER:
             raise PermissionDenied("只有支付执行人可以登记支付")
+        if not request_id or not isinstance(request_id, str) \
+                or not request_id.strip():
+            raise PaymentRejected("支付请求必须携带稳定业务标识 request_id")
+        request_id = request_id.strip()
+
         d = self._decision(decision_id)
+        report = self.reports[d["alias"]]
+
+        # 匿名指令无论首笔还是重放都必须重新出示正确领取码（先认证、
+        # 后回放），避免仅凭截获的 request_id 读到凭证内容。
+        if report["is_anonymous"]:
+            if not claim_code:
+                raise PermissionDenied("匿名举报须凭领取码支付")
+            digest = hashlib.sha256(claim_code.encode()).hexdigest()
+            if not hmac.compare_digest(digest, report["claim_code_hash"]):
+                raise PermissionDenied("领取码校验失败")
+
+        # 幂等快速路径优先于其他内容校验：已有首次凭证时，决定/金额/领取人
+        # 任一不同即按同标识异内容拒绝，不受后续状态变化影响
+        # （历史支付不可撤销、不可改写）。
+        prior = self._payment_index.get(request_id)
+        if prior is not None:
+            self._replay_or_reject(prior, decision_id, alias, amount)
+            return dict(prior)
+
+        if alias is not None and alias != d["alias"]:
+            raise PaymentRejected(
+                f"领取人不匹配：该决定的领取人为 {d['alias']}")
+        alias = d["alias"]
         if d["status"] != DECISION_EFFECTIVE:
             raise InvalidStateError("只有已生效的决定可以支付")
-        report = self.reports[d["alias"]]
         if report["withdrawn"]:
             raise InvalidStateError("举报人已撤回，不得支付")
         chain = self._adjustment_chain(d)
         if chain and chain[-1]["status"] in (ADJUST_PENDING_REVIEW,
                                               ADJUST_PENDING_COSIGN):
             raise InvalidStateError("存在在途追加决定，待办结后再支付")
-        # 以已生效追加决定后的金额为支付上限
+        # 以最新已生效追加决定后的金额为可付上限
         tail = self._tail_adjustment(d)
         cap_amount = tail["new_amount"] if tail else d["amount"]
         already = self._paid_amount(decision_id)
-        if report["is_anonymous"]:
-            if not claim_code:
-                raise PermissionDenied("匿名举报须凭领取码支付")
-            digest = hashlib.sha256(claim_code.encode()).hexdigest()
-            if digest != report["claim_code_hash"]:
-                raise PermissionDenied("领取码校验失败")
         remaining = cap_amount - already
-        pay_amount = _round_yuan(amount if amount is not None else remaining)
+
+        if amount is None:
+            pay_amount = remaining
+        else:
+            pay_amount = _round_yuan(amount)
         if pay_amount <= 0 or pay_amount > remaining:
-            raise DomainError(f"可支付余额为 {max(remaining, 0)} 元")
+            raise PaymentRejected(f"可支付余额为 {max(remaining, 0)} 元")
+
+        # 临界区内完成最后的余额复核与落账（本方法全程持锁，检查与落账
+        # 之间不可能插入追加决定生效或另一笔支付）。
         record = {
-            "payment_id": f"P-{len(self.payments) + 1:04d}",
+            "payment_id": self._next_payment_id(),
+            "request_id": request_id,
             "decision_id": decision_id,
-            "alias": d["alias"],
+            "alias": alias,
             "case_id": d["case_id"],
             "amount": pay_amount,
             "paid_by": payer_id,
             "paid_at": paid_at or self._today(),
+            "kind": "payment",
         }
         self.payments.append(record)
-        self._log("奖励支付", alias=d["alias"], case_id=d["case_id"],
-                  decision_id=decision_id, amount=pay_amount)
-        return record
+        self._payment_index[request_id] = record
+        self._log("奖励支付", alias=alias, case_id=record["case_id"],
+                  decision_id=decision_id, payment_id=record["payment_id"],
+                  request_id=request_id, amount=pay_amount)
+        return dict(record)
+
+    def _replay_or_reject(self, prior, decision_id, alias, amount):
+        """同标识重试：内容一致返回首次凭证，异内容拒绝（不暴露领取码）。"""
+        mismatches = []
+        if prior["decision_id"] != decision_id:
+            mismatches.append("决定")
+        if alias is not None and prior["alias"] != alias:
+            mismatches.append("领取人")
+        requested = None if amount is None else _round_yuan(amount)
+        if requested is not None and prior["amount"] != requested:
+            mismatches.append("金额")
+        if mismatches:
+            raise IdempotencyConflict(
+                f"request_id 已绑定其他支付指令（差异：{'、'.join(mismatches)}），"
+                "同标识异内容不予支付")
+
+    def _next_payment_id(self):
+        n = sum(1 for p in self.payments if p.get("kind", "payment")
+                == "payment") + 1
+        return f"P-{n:04d}"
 
     def _paid_amount(self, decision_id):
+        """某决定项下全部凭证金额的净额（发放为正、追回为负）。"""
         return sum(p["amount"] for p in self.payments
                    if p["decision_id"] == decision_id)
 
@@ -624,6 +739,7 @@ class RewardCenter:
     # 7. 追加决定（撤回 / 重复 / 复议 / 判决），旧结论保留
     # ------------------------------------------------------------------
 
+    @_synchronized
     def withdraw_report(self, alias, actor_id, actor_role, withdrawn_at=None):
         """举报人撤回：标记线索，并对已有决定生成调减为 0 的追加决定。"""
         if actor_role != ROLE_INTAKE:
@@ -648,6 +764,7 @@ class RewardCenter:
                     proposed_by=actor_id))
         return made
 
+    @_synchronized
     def adjust_decision(self, decision_id, kind, actor_id, actor_role,
                         new_penalty_amount=None, reason="", changed_at=None):
         """对生效决定作出追加决定（复议、判决变化、重复确认等）。
@@ -699,6 +816,9 @@ class RewardCenter:
         if base_amount is None:
             tail = self._tail_adjustment(decision)
             base_amount = tail["new_amount"] if tail else decision["amount"]
+        # 发起调整时的累计净支付：审核期间可解释“按现状生效会形成多少
+        # 应追回/新增余额”，且不依赖支付历史是否变动（支付在在途期间被禁止）。
+        paid_at_create = self._paid_amount(decision["decision_id"])
         # 追加决定链：指向上一节点（原决定或上一道追加决定），形成完整沿革
         chain = self._adjustment_chain(decision)
         prev_id = chain[-1]["adjustment_id"] if chain else None
@@ -721,6 +841,12 @@ class RewardCenter:
             "reviewed_by": None,
             "cosigned_by": None,
             "created_at": changed_at or self._today(),
+            "effective_at": None,
+            # 发起/生效时点的累计净支付，生效后据此固化应追回与新增余额
+            "paid_total_at_create": paid_at_create,
+            "paid_total_at_effect": None,
+            "clawback_due": None,      # 降额：应追回差额（>0），历史支付不改写
+            "open_balance": None,      # 升额：开放的新增可付余额（>0）
         }
         self.adjustments[adj["adjustment_id"]] = adj
         # 只在首次被调整时留痕；原决定记录始终保留不删改
@@ -757,6 +883,7 @@ class RewardCenter:
                 tail = adj
         return tail
 
+    @_synchronized
     def review_adjustment(self, adjustment_id, reviewer_id, actor_role, approve=True):
         if actor_role != ROLE_REVIEWER:
             raise PermissionDenied("只有奖励审核人可以审核追加决定")
@@ -780,6 +907,7 @@ class RewardCenter:
                   adjustment_id=adjustment_id, status=adj["status"])
         return adj["status"]
 
+    @_synchronized
     def cosign_adjustment(self, adjustment_id, finance_id, actor_role, agree=True):
         if actor_role != ROLE_FINANCE:
             raise PermissionDenied("只有财政会签人可以会签")
@@ -801,26 +929,38 @@ class RewardCenter:
         return adj["status"]
 
     def _effect_adjustment(self, adj):
+        """追加决定生效（始终在屏障锁内被调用）。
+
+        已经成功的历史支付凭证一律不撤销、不改写、不补记：
+        - 降额：不产生负向“追回凭证”，只固化“应追回差额”——生效时点
+          累计净支付超出新结论金额的部分，供线下追款核对；
+        - 升额：不自动补付，只把新增差额开放为可付余额，由此后带新
+          request_id 的支付请求逐笔领取（同样受余额与领取人绑定约束）。
+        """
         adj["status"] = ADJUST_EFFECTIVE
-        delta = adj["delta"]
-        if delta != 0:
-            # 正向为补付，负向为追回（金额记负）
-            self.payments.append({
-                "payment_id": f"P-{len(self.payments) + 1:04d}",
-                "decision_id": adj["decision_id"],
-                "adjustment_id": adj["adjustment_id"],
-                "alias": adj["alias"],
-                "case_id": adj["case_id"],
-                "amount": delta,
-                "paid_by": "system-adjustment",
-                "paid_at": self._today(),
-                "note": "补付" if delta > 0 else "追回",
-            })
+        adj["effective_at"] = self._today()
+        paid_total = self._paid_amount(adj["decision_id"])
+        adj["paid_total_at_effect"] = paid_total
+        new_amount = adj["new_amount"]
+        if new_amount < paid_total:
+            adj["clawback_due"] = paid_total - new_amount
+            adj["open_balance"] = 0
+        elif new_amount > paid_total:
+            adj["clawback_due"] = 0
+            adj["open_balance"] = new_amount - paid_total
+        else:
+            adj["clawback_due"] = 0
+            adj["open_balance"] = 0
+        self._log("追加决定生效", alias=adj["alias"], case_id=adj["case_id"],
+                  adjustment_id=adj["adjustment_id"], new_amount=new_amount,
+                  paid_total=paid_total, clawback_due=adj["clawback_due"],
+                  open_balance=adj["open_balance"])
 
     # ------------------------------------------------------------------
     # 8. 精神奖励（与物质奖励并行）
     # ------------------------------------------------------------------
 
+    @_synchronized
     def grant_commendation(self, alias, level, reason, actor_id, actor_role):
         """颁发精神奖励（通报表扬/荣誉证书/锦旗），与物质奖励互不影响。"""
         if actor_role != ROLE_INTAKE:
@@ -845,6 +985,7 @@ class RewardCenter:
     # 9. 逐人说明视图（资格 / 待办审批 / 实际支付）
     # ------------------------------------------------------------------
 
+    @_synchronized
     def explain_case(self, case_id):
         """按别名逐人说明：资格、奖励结论、待办审批、实际支付。"""
         case = self._case(case_id)
@@ -900,12 +1041,23 @@ class RewardCenter:
                                 "stage": PENDING_LABELS[a["status"]],
                                 "proposed_amount": a["new_amount"]})
 
-        paid = sum(p["amount"] for p in self.payments
-                   if p["alias"] == alias and p["case_id"] == case["case_id"])
+        # 累计支付只统计真实发放凭证（调整不再生成负向凭证）
+        vouchers = [p for p in self.payments
+                    if p["alias"] == alias
+                    and p["case_id"] == case["case_id"]
+                    and p.get("kind", "payment") == "payment"]
+        vouchers.sort(key=lambda p: (p["paid_at"], p["payment_id"]))
+        paid = sum(p["amount"] for p in vouchers)
         tail = self._tail_adjustment(current) if current else None
         effective_amount = None
+        remaining_amount = None
+        clawback_due = 0
         if current is not None:
             effective_amount = tail["new_amount"] if tail else current["amount"]
+            # 剩余可付金额以最新已生效结论为上限；降额超付部分不为负，
+            # 而是作为应追回差额列示，历史支付不被改写
+            remaining_amount = max(effective_amount - paid, 0)
+            clawback_due = tail["clawback_due"] if tail else 0
         commendations = [c for c in self.commendations.values()
                          if c["alias"] == alias]
 
@@ -925,16 +1077,46 @@ class RewardCenter:
                     "rule_version": current["rule_version"],
                 }),
             "effective_amount": effective_amount,
+            "paid_total": paid,
+            "remaining_amount": remaining_amount,
+            "clawback_due": clawback_due,
+            "payment_vouchers": [{
+                "payment_id": p["payment_id"],
+                "request_id": p["request_id"],
+                "decision_id": p["decision_id"],
+                "amount": p["amount"],
+                "paid_by": p["paid_by"],
+                "paid_at": p["paid_at"],
+            } for p in vouchers],
+            "adjustment_chain": [{
+                "adjustment_id": a["adjustment_id"],
+                "kind": a["kind"],
+                "kind_label": a["kind_label"],
+                "prev_adjustment_id": a["prev_adjustment_id"],
+                "old_amount": a["old_amount"],
+                "new_amount": a["new_amount"],
+                "delta": a["delta"],
+                "status": a["status"],
+                "reason": a["reason"],
+                "created_at": a["created_at"],
+                "effective_at": a["effective_at"],
+                "paid_total_at_create": a["paid_total_at_create"],
+                "paid_total_at_effect": a["paid_total_at_effect"],
+                "clawback_due": a["clawback_due"],
+                "open_balance": a["open_balance"],
+            } for a in adjustments],
             "adjustments": [{
                 "adjustment_id": a["adjustment_id"],
                 "kind_label": a["kind_label"],
                 "old_amount": a["old_amount"],
                 "new_amount": a["new_amount"],
+                "delta": a["delta"],
                 "status": a["status"],
                 "reason": a["reason"],
+                "clawback_due": a["clawback_due"],
+                "open_balance": a["open_balance"],
             } for a in adjustments],
             "pending_approvals": pending,
-            "paid_total": paid,
             "commendations": [
                 {"level": c["level"], "granted_at": c["granted_at"]}
                 for c in commendations],
@@ -944,6 +1126,7 @@ class RewardCenter:
     # 10. 对外视图：承办人 / 对外材料 / 普通日志均不含身份
     # ------------------------------------------------------------------
 
+    @_synchronized
     def case_file_for_handler(self, case_id, actor_id, actor_role):
         """承办人办案视图：只有别名与办案所需信息。"""
         if actor_role not in (ROLE_HANDLER, ROLE_REVIEWER, ROLE_FINANCE,
@@ -972,6 +1155,7 @@ class RewardCenter:
             "reports": reports,
         }
 
+    @_synchronized
     def public_case_material(self, case_id):
         """对外材料：只含公开字段，举报人以别名+贡献标注出现。"""
         case = self._case(case_id)
@@ -985,16 +1169,19 @@ class RewardCenter:
             } for al in case["aliases"]],
         }
 
+    @_synchronized
     def ordinary_case_log(self, case_id):
         """普通办案日志（只含别名级条目）。"""
         return [dict(e) for e in self.event_log
                 if e.get("case_id") == case_id]
 
+    @_synchronized
     def reveal_identity(self, alias, actor_id, actor_role, reason):
         """查看身份的唯一入口：受角色限制且全程留痕。"""
         identity = self.vault.reveal(alias, actor_id, actor_role, reason)
         return identity
 
+    @_synchronized
     def identity_access_log(self, actor_role):
         if actor_role != ROLE_AUDITOR:
             raise PermissionDenied("只有审计查看人可以查阅身份访问台账")

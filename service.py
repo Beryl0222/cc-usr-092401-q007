@@ -18,6 +18,8 @@ from reward_center import (
     NotFoundError,
     PermissionDenied,
     InvalidStateError,
+    IdempotencyConflict,
+    PaymentRejected,
     basic_check,
 )
 
@@ -124,8 +126,12 @@ def handle_pay(center, body):
     actor_id, role = _actor(body)
     record = center.pay_decision(
         body["decision_id"], actor_id, role,
-        amount=body.get("amount"), claim_code=body.get("claim_code"),
+        request_id=body.get("request_id"),
+        amount=body.get("amount"),
+        alias=body.get("alias"),
+        claim_code=body.get("claim_code"),
         paid_at=body.get("at"))
+    # 凭证只含别名与业务标识，绝不回显领取码
     return 200, record
 
 
@@ -193,7 +199,9 @@ POST_ROUTES = {
 ERROR_STATUS = {
     NotFoundError: 404,
     PermissionDenied: 403,
+    IdempotencyConflict: 409,
     InvalidStateError: 409,
+    PaymentRejected: 422,
     DomainError: 400,
     KeyError: 400,
     TypeError: 400,
@@ -270,7 +278,8 @@ class Handler(BaseHTTPRequestHandler):
             self._domain_error(exc)
             return
         except (KeyError, TypeError) as exc:
-            self._send_json(400, {"error": f"缺少或错误的参数：{exc}"})
+            self._send_json(400, {"error": f"缺少或错误的参数：{exc}",
+                                  "error_code": "BAD_REQUEST"})
             return
         self._send_json(status, payload)
 
@@ -280,7 +289,11 @@ class Handler(BaseHTTPRequestHandler):
             if isinstance(exc, error_type):
                 status = code
                 break
-        self._send_json(status, {"error": str(exc)})
+        # 稳定错误码：异常类型决定 error_code，文案可演进，调用方按码分支
+        self._send_json(status, {
+            "error": str(exc),
+            "error_code": getattr(exc, "error_code", "DOMAIN_ERROR"),
+        })
 
     def log_message(self, *_args):
         return

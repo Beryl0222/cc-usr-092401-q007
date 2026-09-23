@@ -20,8 +20,18 @@
 - **规则版本锁定**：案件进入可奖励阶段时锁定当时生效的规则；之后的行政复议、
   判决变化即使跨越规则生效日，也按锁定版本重算。
 - **只追加调整**：撤回、重复确认、复议、判决变化均产生追加决定，原决定原样保留；
-  追加决定同样走审核（及必要时会签），生效后自动补付或追回，驳回则旧结论维持。
-- **匿名支付**：匿名举报生成一次性领取码，支付时校验，业务记录仍只写别名。
+  追加决定同样走审核（及必要时会签）。追加决定在途（待审核/待会签）期间禁止
+  支付；**已成功的历史支付凭证一律不撤销、不改写、不补记**——降额只在调整
+  生效时固化“应追回差额”（累计支付超过新生效金额的部分），升额只开放新增
+  可付余额，由之后的新支付指令逐笔领取。
+- **幂等支付**：每个支付请求必须携带调用方生成的稳定业务标识 `request_id`
+  （网络重试原样复用，不得换新号），并绑定决定、金额、领取人（`alias`）。
+  同标识同内容重试返回**首次凭证**（同一 `payment_id`，不重复落账）；同标识
+  异内容（决定/金额/领取人不同）返回 409 `IDEMPOTENCY_CONFLICT`；匿名指令
+  即使是重放也必须重新出示正确领取码。支持部分支付：余额检查与支付落账在
+  同一临界区（进程内全局屏障锁）完成，并发拆付合计绝不超过最新已生效结论。
+- **匿名支付**：匿名举报生成一次性领取码，支付时校验；领取码（含哈希）不进
+  普通日志、支付凭证与任何响应，业务记录仍只写别名。
 
 规则版本与系数集中在 `reward_center.py` 的 `DEFAULT_RULES`（当前含 2023-01、
 2026-01 两版，可扩展）。
@@ -42,24 +52,58 @@
 | `POST /rewards/propose` | 按规则自动生成奖励建议（禁止手填金额） |
 | `POST /rewards/approve` | 奖励审核（拒绝自审） |
 | `POST /rewards/cosign` | 财政会签（仅 ≥ 20 万元时需要） |
-| `POST /rewards/pay` | 支付（匿名须带 `claim_code`） |
+| `POST /rewards/pay` | 支付（须带稳定 `request_id`，可选 `alias`/`amount` 部分支付；匿名须带 `claim_code`） |
 | `POST /rewards/adjust` | 追加决定：withdrawal/duplicate/reconsideration/judgment |
 | `POST /rewards/adjustment/approve` | 追加决定审核 |
 | `POST /rewards/adjustment/cosign` | 追加决定会签 |
 | `POST /commendations` | 登记精神奖励 |
 | `POST /identity/reveal` | 查看真实身份（受限且留痕） |
-| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/实际支付/调整沿革 |
+| `GET /cases/{id}/explain` | 逐人说明：资格/待办审批/累计支付/剩余金额/应追回/凭证与调整沿革 |
 | `GET /cases/{id}/file` | 承办人办案视图（仅别名） |
 | `GET /cases/{id}/public` | 对外材料 |
 | `GET /cases/{id}/log` | 普通办案日志 |
 | `GET /identity/access-log?role=audit_viewer` | 身份访问台账 |
+
+## 支付幂等与并发语义
+
+- `request_id` 由调用方生成并在**同一指令的所有重试中保持不变**；成功后
+  绑定 `(decision_id, alias, amount)`，服务端返回 `payment_id` 稳定的首次
+  凭证。校验失败（余额、领取码、状态）不占用该标识，纠正后可用同一标识重试。
+- 不带金额（`amount` 缺省）即结清当前剩余可付金额；部分支付可逐笔进行。
+- 在途追加决定（撤回/重复/复议/判决变化待审核或待会签）期间所有支付被拒，
+  裁决顺序为“先到先得、全程持同一屏障锁”：审核先生效则按新结论支付
+  （降额仅余应追回、升额开放新增余额），支付先落账则调整在既有支付之上
+  固化差额。两种顺序下历史凭证均不变化，差额都可在 `explain` 核对。
+- 错误响应统一携带稳定错误码 `error_code`：
+
+  | HTTP | error_code | 含义 |
+  |---|---|---|
+  | 403 | `PERMISSION_DENIED` | 角色/领取码不符 |
+  | 404 | `NOT_FOUND` | 决定/案件等不存在 |
+  | 409 | `INVALID_STATE` | 决定未生效、已撤回或存在在途追加决定 |
+  | 409 | `IDEMPOTENCY_CONFLICT` | 同 `request_id` 绑定的决定/金额/领取人不同 |
+  | 422 | `PAYMENT_REJECTED` | 缺 `request_id`、领取人不匹配、金额超出可付余额 |
+  | 400 | `DOMAIN_ERROR` / `BAD_REQUEST` | 其他业务或参数错误 |
+
+## 逐人说明核对口径
+
+`GET /cases/{id}/explain` 中每名举报人含：
+
+- `paid_total`：累计**发放**净额（仅真实支付凭证，调整不再产生负向凭证）；
+- `remaining_amount`：剩余可付金额，满足 `paid_total + remaining_amount`
+  不超过 `effective_amount`；
+- `clawback_due`：降额生效后固化的应追回差额，
+  满足 `paid_total = effective_amount + clawback_due`（超付时）；
+- `payment_vouchers`：逐笔凭证（`payment_id`/`request_id`/金额/支付人/日期）；
+- `adjustment_chain`：完整调整链，含每道决定的 `old_amount`/`new_amount`/
+  `delta`、生效时累计支付快照、`clawback_due` 与 `open_balance`。
 
 ## 运行与测试
 
 ```bash
 python3 service.py --check   # 规则与服务自检
 python3 service.py --port 8000
-npm test                     # 契约 + 领域规则 + HTTP 端到端，共 33 项
+npm test                     # 契约 + 领域规则 + HTTP 端到端 + 支付链并发/重放/竞态，共 53 项
 ```
 
 `fixtures/domain.json` 保存领域名词与状态样例，便于接口联调时保持一致语义。
