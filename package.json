@@ -1,0 +1,7 @@
+{
+  "name": "whistleblower-reward",
+  "private": true,
+  "scripts": {
+    "test": "node test_service.js"
+  }
+}
